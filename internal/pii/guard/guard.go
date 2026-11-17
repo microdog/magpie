@@ -1,8 +1,9 @@
 // Package guard runs AstrLink Guard (QuantumNous/astrlink-guard,
 // Apache-2.0), a token classifier for secrets and personal data in Chinese
 // and English text: its int8 ONNX model (37 MB) read by onnx.go and run
-// by bert.go on the CPU in Go, or on a Mac by CoreML (coreml.go),
-// its tokenizer by tokenizer.go. Nothing is started.
+// by bert.go on the CPU in Go, on a Mac by CoreML (coreml.go), or on
+// Linux on x86-64 by ONNX Runtime (ort.go), its tokenizer by
+// tokenizer.go. Nothing is started.
 package guard
 
 import (
@@ -38,6 +39,11 @@ type Model struct {
 	// mlFail is why CoreML's last read failed and bert.go read the window
 	// instead; nil once one doesn't.
 	mlFail atomic.Pointer[string]
+	rt     *ortReader // nil where LoadOn had no ONNX Runtime, or it couldn't be opened
+	// RTErr is why ONNX Runtime isn't used, where LoadOn had its files.
+	RTErr error
+	// rtFail is mlFail for ONNX Runtime.
+	rtFail atomic.Pointer[string]
 }
 
 // Backend is what reads the model now, as Settings › Privacy names it:
@@ -45,7 +51,8 @@ type Model struct {
 // on ("Neural Engine", "GPU" or "CPU"; "" where the plan can't be read),
 // or bert.go on the CPU (via ""), and then on a Mac why not CoreML: it
 // couldn't be made, or its last read failed. Settings said "on the CPU"
-// while CoreML read every window (yyhhyyyyyy on Discord, 10-27).
+// while CoreML read every window (yyhhyyyyyy on Discord, 10-27). Where
+// ONNX Runtime reads instead of bert.go, Runtime says so.
 func (m *Model) Backend() (via, device string, err error) {
 	if m.ml == nil {
 		if !coreml.Available {
@@ -86,7 +93,12 @@ const (
 )
 
 // Load reads the model in dir.
-func Load(dir string) (*Model, error) {
+func Load(dir string) (*Model, error) { return LoadOn(dir, Runtime{}) }
+
+// LoadOn is Load with ONNX Runtime to read the model where CoreML
+// doesn't: one that can't be opened leaves bert.go reading, and RTErr
+// says why.
+func LoadOn(dir string, rt Runtime) (*Model, error) {
 	tok, err := loadTokenizer(filepath.Join(dir, "tokenizer.json"), vocabSize)
 	if err != nil {
 		return nil, fmt.Errorf("tokenizer: %w", err)
@@ -100,12 +112,16 @@ func Load(dir string) (*Model, error) {
 	}
 	m := &Model{tok: tok, net: nt}
 	m.ml, m.MLErr = openCoreML(dir, nt)
+	if m.ml == nil && rt.Lib != "" {
+		m.rt, m.RTErr = openORT(dir, rt)
+	}
 	return m, nil
 }
 
 // logits are the network's scores for ids, from CoreML when it is there
-// and the window is long enough to gain by it, else over procs goroutines
-// (0: as many of cores as are free, holding them while it reads).
+// and the window is long enough to gain by it, or from ONNX Runtime
+// when that is, else over procs goroutines (0: as many of cores as are
+// free, holding them while it reads).
 func (m *Model) logits(ids []int, procs int) []float32 {
 	if m.ml != nil && len(ids) >= coremlMin {
 		lg, err := coremlRead(m.ml, m.net, ids)
@@ -116,7 +132,16 @@ func (m *Model) logits(ids []int, procs int) []float32 {
 		e := err.Error()
 		m.mlFail.Store(&e)
 	}
-	if procs == 0 { // CoreML's reader: a core of cores, and all that are free
+	if m.rt != nil {
+		lg, err := ortRead(m.rt, ids)
+		if err == nil {
+			m.rtFail.Store(nil)
+			return lg
+		}
+		e := err.Error()
+		m.rtFail.Store(&e)
+	}
+	if procs == 0 { // CoreML's or ONNX Runtime's reader: a core of cores, and all that are free
 		procs = take(Cores())
 		defer give(procs)
 	}
@@ -190,7 +215,7 @@ func (m *Model) Find(text string) []Span {
 		}
 		return append(ids, 2)
 	}
-	if m.ml != nil {
+	if m.ml != nil || m.rt != nil {
 		for w := range starts {
 			lgs[w] = m.logits(ids(w), 0)
 		}
