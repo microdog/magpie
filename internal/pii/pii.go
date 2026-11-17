@@ -161,6 +161,13 @@ type Status struct {
 	GPU      bool   `json:"gpu,omitempty"`
 	LoadMS   int    `json:"loadMs,omitempty"`
 	GPUError string `json:"gpuError,omitempty"`
+	// Runtime is "ONNX Runtime" where it reads AstrLink Guard (Linux on
+	// x86-64): on an NVIDIA GPU with GPU set and Device "CUDA", else on
+	// the CPU. RuntimeError is why it doesn't read, or not on the GPU,
+	// or why its files weren't downloaded. They aren't Via and
+	// GPUError, which Settings words as CoreML's.
+	Runtime      string `json:"runtime,omitempty"`
+	RuntimeError string `json:"runtimeError,omitempty"`
 	// GPUReset says the GPU was lost to its driver resetting it
 	// (Vulkan's device lost), not to a fault of the model's; GPUAgain
 	// is when the GPU is tried again (Unix ms), while that is ahead

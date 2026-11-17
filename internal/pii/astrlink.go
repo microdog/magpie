@@ -16,7 +16,9 @@ import (
 // AstrLink Guard (QuantumNous/astrlink-guard, Apache-2.0) is the second
 // local model: a 37 MB int8 token classifier for Chinese and English,
 // run in magpie's own process by internal/pii/guard, on the CPU of every
-// system and through CoreML on a Mac, with nothing native to download. Its files are fetched from
+// system and through CoreML on a Mac, with nothing native to download
+// (but ONNX Runtime on Linux on x86-64, which reads it faster once it is
+// fetched: onnxruntime.go). Its files are fetched from
 // Hugging Face at the revision their sha256 were pinned at (the
 // publisher's own listing), and are loaded on the first request that
 // needs them and let go after idleAfter with none.
@@ -105,11 +107,12 @@ func guardInstall(ctx context.Context) error {
 	return nil
 }
 
-// removeOldGuard deletes the folders of revisions pinned before.
+// removeOldGuard deletes the folders of revisions pinned before, and of
+// builds of ONNX Runtime this computer doesn't read with.
 func removeOldGuard() {
 	es, _ := os.ReadDir(guardRoot())
 	for _, e := range es {
-		if e.IsDir() && e.Name() != filepath.Base(guardDir()) {
+		if e.IsDir() && !keptInRoot(e.Name()) {
 			os.RemoveAll(filepath.Join(guardRoot(), e.Name()))
 		}
 	}
@@ -140,9 +143,10 @@ type backender interface {
 	Backend() (via, device string, err error)
 }
 
-// guardLoad reads the model; a var for tests.
+// guardLoad reads the model, with ONNX Runtime where its files are on
+// disk (guardRuntime); a var for tests.
 var guardLoad = func(dir string) (spanFinder, error) {
-	m, err := guard.Load(dir)
+	m, err := guard.LoadOn(dir, guardRuntime())
 	if err != nil {
 		return nil, err
 	}
@@ -354,9 +358,21 @@ func (guardModel) Now() Status {
 				s.GPUError = err.Error()
 			}
 		}
+		if r, ok := gsrv.m.(runtimer); ok {
+			name, device, err := r.Runtime()
+			if s.Runtime = name; device == "CUDA" {
+				s.GPU, s.Device = true, device
+			}
+			if err != nil {
+				s.RuntimeError = err.Error()
+			}
+		}
 	}
 	s.Failed, s.Loading = gsrv.failed, gsrv.loading
 	gsrv.mu.Unlock()
+	if e := ortFailed(); e != "" && s.RuntimeError == "" {
+		s.RuntimeError = e
+	}
 	s.Waiting = int(guardBackend.waiting.Load())
 	return s
 }
@@ -394,6 +410,7 @@ func (g guardModel) Remove() error {
 		return errMoving
 	}
 	g.Cancel()
+	odl.stop()
 	g.Stop()
 	gdl.mu.Lock()
 	gdl.err = ""
